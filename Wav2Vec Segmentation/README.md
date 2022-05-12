@@ -4,3 +4,4 @@
 * **modeling_segmentation.py, model_transformers.py, models.py, utils.py** - основные файлы со скриптами 
 * **Transformers_.ipynb** - тетради с обучением моделей
 * **Predict_.ipynb** - тетради с оценкой моделей
+* **results_.csv** - файлы с оценкой метрик
