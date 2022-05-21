@@ -17,49 +17,6 @@ from typing import Optional, Tuple, Union
 import gc
 
 # Приведенные функции основаны на https://github.com/NVIDIA/NeMo и https://github.com/huggingface    
-
-# class NegativeSampler(nn.Module):
-    
-#     def __init__(self, n_negatives = 1, loss_args = {'reduction': 'mean'}):
-#         super(NegativeSampler, self).__init__()
-#         self.n_negatives = n_negatives
-#         self.loss = ConstrativeLoss(**loss_args)
-        
-#     def forward(self, x, transpose = False, attention_mask = None):
-# #         if transpose:
-# #             x = x.transpose(1, 2)
-#         targets = torch.roll(x, -1, dims=1)
-        
-#         negatives, negs_ids = sample_negatives(targets, n_negatives = self.n_negatives, attention_mask = attention_mask)
-#         return x, targets, negatives
-        
-#     def compute_all(self, batch, transpose = False, attention_mask = None):
-        
-#         x, targets, negatives = self.forward(batch, transpose, attention_mask = attention_mask)
-#         loss, acc_score = self.loss(x, targets, negatives)
-#         return loss, dict(loss=loss.item(), 
-#                           acc=acc_score)
-
-    
-# class TransposeLast(torch.nn.Module):
-#     """
-#     Transposes last dimension. Useful for adding to a sequential block.
-#     """
-
-#     def forward(self, x):
-#         return x.transpose(-2, -1)
-
-
-# class SamePad(torch.nn.Module):
-#     def __init__(self, kernel_size):
-#         super().__init__()
-#         self.remove = kernel_size % 2 == 0
-
-#     def forward(self, x):
-#         if self.remove:
-#             x = x[:, :, :-1]
-#         return x
-    
 # Данная функция основана на https://github.com/felixkreuk/UnsupSeg/blob/master/utils.py
 class RMetrics(nn.Module):
     def __init__(self, eps = 1e-5, tolerance = 2, sampling_rate = 16000):
