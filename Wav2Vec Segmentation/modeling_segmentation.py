@@ -11,17 +11,13 @@ from transformers_f.src.transformers.models.wav2vec2.modeling_wav2vec2 import (W
                                                                                Wav2Vec2FeatureExtractor, 
                                                                                Wav2Vec2PositionalConvEmbedding)
 from utils import buffered_arange, sample_negatives, ConstrativeLoss
-<<<<<<< HEAD
 from models import NegativeSampler, TransposeLast, SamePad
-=======
->>>>>>> a9f7e9b1c54950d3b2176d16ff87ed846d675eaa
 from transformers_f.src.transformers.deepspeed import is_deepspeed_zero3_enabled
 from typing import Optional, Tuple, Union
 import gc
 
 # Приведенные функции основаны на https://github.com/NVIDIA/NeMo и https://github.com/huggingface    
 
-<<<<<<< HEAD
 # class NegativeSampler(nn.Module):
     
 #     def __init__(self, n_negatives = 1, loss_args = {'reduction': 'mean'}):
@@ -52,38 +48,6 @@ import gc
 
 #     def forward(self, x):
 #         return x.transpose(-2, -1)
-=======
-class NegativeSampler(nn.Module):
-    
-    def __init__(self, n_negatives = 10, loss_args = {'reduction': 'mean'}):
-        super(NegativeSampler, self).__init__()
-        self.n_negatives = n_negatives
-        self.loss = ConstrativeLoss(**loss_args)
-        
-    def forward(self, x, transpose = False):
-        if transpose:
-#             print('Transpose')
-            x = x.transpose(1, 2)
-        targets = torch.roll(x, -1, dims=1)
-        
-        negatives, negs_ids = sample_negatives(targets, n_negatives = self.n_negatives)
-        return x, targets, negatives
-        
-    def compute_all(self, batch, transpose = False):
-        
-        x, targets, negatives = self.forward(batch, transpose)
-        loss, acc_score = self.loss(x, targets, negatives)
-        return loss, dict(loss=loss.item(), 
-                          acc=acc_score)
-
-class TransposeLast(torch.nn.Module):
-    """
-    Transposes last dimension. Useful for adding to a sequential block.
-    """
-
-    def forward(self, x):
-        return x.transpose(-2, -1)
->>>>>>> a9f7e9b1c54950d3b2176d16ff87ed846d675eaa
 
 
 # class SamePad(torch.nn.Module):
