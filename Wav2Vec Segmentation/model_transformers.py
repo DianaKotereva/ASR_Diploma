@@ -1,6 +1,5 @@
 import torch
 from torch import nn
-from utils import ConstrativeLoss, sample_negatives
 import numpy as np
 from sklearn.metrics import precision_score, recall_score, f1_score
 from pytorch_lightning import LightningDataModule, LightningModule, Trainer

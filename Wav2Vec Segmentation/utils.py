@@ -3,6 +3,8 @@ import torch.nn.functional as F
 from torch import nn
 import numpy as np
 
+# Приведенные функции основаны на https://github.com/NVIDIA/NeMo и https://github.com/huggingface    
+
 def buffered_arange(max):
     if not hasattr(buffered_arange, "buf"):
         buffered_arange.buf = torch.LongTensor()
@@ -128,16 +130,11 @@ class ConstrativeLoss(nn.Module):
         attent = attent.reshape(-1)
         
         loss = torch.mean(F.cross_entropy(similarity_scores, similarity_targets, reduction='none')*attent)
-#         loss = F.cross_entropy(similarity_scores, similarity_targets, reduction=self.reduction)
 
         acc_score = np.mean((torch.argmax(similarity_scores, dim = 1)*attent).cpu().numpy() == 0)
         return loss, acc_score
-#         else:
-#             return loss
 
     def _calculate_similarity(self, logits, negatives, targets):
-#         neg_is_pos = (targets == negatives).all(-1)
-#         print(neg_is_pos)
         targets = targets.unsqueeze(0)
         targets = torch.cat([targets, negatives], dim=0) 
         if self.cut:
@@ -145,6 +142,4 @@ class ConstrativeLoss(nn.Module):
             targets = targets[:, :, :-1, :]
         logits = torch.cosine_similarity(logits.float(), targets.float(), dim=-1).type_as(logits)
         logits /= self.logit_temp
-#         if neg_is_pos.any():
-#             logits[1:][neg_is_pos] = float("-inf")
         return logits
