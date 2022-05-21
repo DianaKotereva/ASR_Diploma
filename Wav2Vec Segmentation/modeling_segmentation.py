@@ -10,163 +10,55 @@ from transformers_f.src.transformers.models.wav2vec2.modeling_wav2vec2 import (W
                                                                                Wav2Vec2Config, 
                                                                                Wav2Vec2FeatureExtractor, 
                                                                                Wav2Vec2PositionalConvEmbedding)
+from utils import buffered_arange, sample_negatives, ConstrativeLoss
+from models import NegativeSampler, TransposeLast, SamePad
 from transformers_f.src.transformers.deepspeed import is_deepspeed_zero3_enabled
 from typing import Optional, Tuple, Union
 import gc
 
 # Приведенные функции основаны на https://github.com/NVIDIA/NeMo и https://github.com/huggingface    
 
-def buffered_arange(max):
-    if not hasattr(buffered_arange, "buf"):
-        buffered_arange.buf = torch.LongTensor()
-    if max > buffered_arange.buf.numel():
-        buffered_arange.buf.resize_(max)
-        torch.arange(max, out=buffered_arange.buf)
-    return buffered_arange.buf[:max]
+# class NegativeSampler(nn.Module):
     
-def sample_negatives(targets, n_negatives = 10):
+#     def __init__(self, n_negatives = 1, loss_args = {'reduction': 'mean'}):
+#         super(NegativeSampler, self).__init__()
+#         self.n_negatives = n_negatives
+#         self.loss = ConstrativeLoss(**loss_args)
         
-        y = targets.clone()
+#     def forward(self, x, transpose = False, attention_mask = None):
+# #         if transpose:
+# #             x = x.transpose(1, 2)
+#         targets = torch.roll(x, -1, dims=1)
         
-        if n_negatives == 0:
-            return y.new(0)
+#         negatives, negs_ids = sample_negatives(targets, n_negatives = self.n_negatives, attention_mask = attention_mask)
+#         return x, targets, negatives
+        
+#     def compute_all(self, batch, transpose = False, attention_mask = None):
+        
+#         x, targets, negatives = self.forward(batch, transpose, attention_mask = attention_mask)
+#         loss, acc_score = self.loss(x, targets, negatives)
+#         return loss, dict(loss=loss.item(), 
+#                           acc=acc_score)
 
-        bsz, tsz, fsz = y.shape
-        num = tsz
-        y = y.view(-1, fsz)  # BTC => (BxT)C
-
-        cross_high = tsz * bsz
-        high = tsz
-#         Большое значение - time в targets
-        with torch.no_grad():
-            assert high > 1, f"{bsz, tsz, fsz}"
-
-            if n_negatives > 0:
-                tszs = buffered_arange(num).unsqueeze(-1).expand(-1, n_negatives).flatten()
-#                 тайм коды - от нуля до максимального = количеству временных срезов в таргете
-
-                neg_idxs = torch.randint(low=0, high=high - 1, size=(bsz, n_negatives * num))
-#                 Выбираем негативные индексы
-#                 Получается 
     
-                neg_idxs[neg_idxs == tszs] += 1
+# class TransposeLast(torch.nn.Module):
+#     """
+#     Transposes last dimension. Useful for adding to a sequential block.
+#     """
 
-        if n_negatives > 0:
-            for i in range(1, bsz):
-                neg_idxs[i] += i * high
-#                 Прибавляем, чтобы было сэмплирование из того же аудио сэмпла, что и сам таргет кусочек
-        else:
-            neg_idxs = cross_neg_idxs
-
-        negs = y[neg_idxs.view(-1)]
-#         Сэмплируем сами негативные примеры
-        
-        negs = negs.view(bsz, num, n_negatives, fsz).permute(
-            2, 0, 1, 3
-        )  # to NxBxTxC
-        return negs, neg_idxs
-    
-class ConstrativeLoss(nn.Module):
-
-    def __init__(self, logit_temp: float = 1.0, 
-                 cut = True, reduction = 'mean'):
-        """
-        Compute the contrastive loss with respect to the model outputs and sampled negatives from quantizer codebooks.
-        Args:
-            logit_temp: Temperature normalization applied in loss.
-            reduce: Reduce loss via sum reduction (Default true)
-        """
-        super().__init__()
-        self.logit_temp = logit_temp
-        self.cut =  cut
-        self.reduction = reduction
-
-    def forward(
-        self,
-        logits: torch.tensor,
-        targets: torch.tensor,
-        negatives: torch.tensor,
-        attention_mask = None
-    ) -> [torch.tensor, torch.tensor, torch.tensor]:
-        """
-        Args:
-            logits: Model activations
-            targets: The true target quantized representations
-            negatives: Sampled negatives from the quantizer codebooks. Sampled from all other timesteps.
-            feature_loss: Feature penalty (L2 Norm)
-        Returns:
-            output loss values, acc_score
-        """
-
-        # Calculate similarity between logits and all targets, returning FxBxT
-        similarity_scores = self._calculate_similarity(logits, negatives, targets)
-
-        # Create targets of size B*T
-        similarity_targets = logits.new_zeros(similarity_scores.size(1) * similarity_scores.size(2), dtype=torch.long)
-
-        # Transpose similarity scores to (T*B)xF for loss
-        similarity_scores = similarity_scores.transpose(0, 2)
-        similarity_scores = similarity_scores.reshape(-1, similarity_scores.size(-1))
-
-        attent = attention_mask[:, :-1].transpose(1, 0)
-        attent = attent.reshape(-1)
-        
-        loss = torch.mean(F.cross_entropy(similarity_scores, similarity_targets, reduction='none')*attent)
-
-        acc_score = np.mean((torch.argmax(similarity_scores, dim = 1)*attent).cpu().numpy() == 0)
-        return loss, acc_score
-
-    def _calculate_similarity(self, logits, negatives, targets):
-        targets = targets.unsqueeze(0)
-        targets = torch.cat([targets, negatives], dim=0) 
-        if self.cut:
-            logits = logits[:, :-1, :]
-            targets = targets[:, :, :-1, :]
-        logits = torch.cosine_similarity(logits.float(), targets.float(), dim=-1).type_as(logits)
-        logits /= self.logit_temp
-        return logits
-
-class NegativeSampler(nn.Module):
-    
-    def __init__(self, n_negatives = 10, loss_args = {'reduction': 'mean'}):
-        super(NegativeSampler, self).__init__()
-        self.n_negatives = n_negatives
-        self.loss = ConstrativeLoss(**loss_args)
-        
-    def forward(self, x, transpose = False):
-        if transpose:
-#             print('Transpose')
-            x = x.transpose(1, 2)
-        targets = torch.roll(x, -1, dims=1)
-        
-        negatives, negs_ids = sample_negatives(targets, n_negatives = self.n_negatives)
-        return x, targets, negatives
-        
-    def compute_all(self, batch, transpose = False):
-        
-        x, targets, negatives = self.forward(batch, transpose)
-        loss, acc_score = self.loss(x, targets, negatives)
-        return loss, dict(loss=loss.item(), 
-                          acc=acc_score)
-
-class TransposeLast(torch.nn.Module):
-    """
-    Transposes last dimension. Useful for adding to a sequential block.
-    """
-
-    def forward(self, x):
-        return x.transpose(-2, -1)
+#     def forward(self, x):
+#         return x.transpose(-2, -1)
 
 
-class SamePad(torch.nn.Module):
-    def __init__(self, kernel_size):
-        super().__init__()
-        self.remove = kernel_size % 2 == 0
+# class SamePad(torch.nn.Module):
+#     def __init__(self, kernel_size):
+#         super().__init__()
+#         self.remove = kernel_size % 2 == 0
 
-    def forward(self, x):
-        if self.remove:
-            x = x[:, :, :-1]
-        return x
+#     def forward(self, x):
+#         if self.remove:
+#             x = x[:, :, :-1]
+#         return x
     
 # Данная функция основана на https://github.com/felixkreuk/UnsupSeg/blob/master/utils.py
 class RMetrics(nn.Module):
@@ -392,7 +284,7 @@ class Wav2Vec2ModelForSegmentation(Wav2Vec2PreTrainedModel):
 
         self.adapter = Wav2Vec2Adapter(config) if config.add_adapter else None
         
-        self.negative_sampler = NegativeSampler(n_negatives = 10, loss_args = {'reduction': 'mean'})
+        self.negative_sampler = NegativeSampler(n_negatives = 1, loss_args = {'reduction': 'mean'})
         self.segment_mean = SegmentsRepr(thres = 0.05)
         self.metr = RMetrics()
         self.num_epoch = 2
@@ -414,13 +306,15 @@ class Wav2Vec2ModelForSegmentation(Wav2Vec2PreTrainedModel):
         extract_features = self.feature_extractor(input_values)
         extract_features = extract_features.transpose(1, 2)
         
-        extract_features, targets_frames, negatives_frames = self.negative_sampler(extract_features)
-        
-        # compute reduced attention_mask corresponding to feature vectors
         attention_mask1 = self._get_feature_vector_attention_mask(
             extract_features.shape[1], attention_mask, add_adapter=False
         )
-
+        
+        extract_features, targets_frames, negatives_frames = self.negative_sampler(extract_features,
+                                                                                   attention_mask=attention_mask1)
+        
+        # compute reduced attention_mask corresponding to feature vectors
+        
         frame_loss, frame_acc_score = self.negative_sampler.loss(extract_features, targets_frames, negatives_frames, 
                                                                 attention_mask=attention_mask1)
         b, mask, x, attention_mask = self.segment_mean(extract_features, attention_mask1, 
@@ -428,13 +322,13 @@ class Wav2Vec2ModelForSegmentation(Wav2Vec2PreTrainedModel):
         
         if return_secs:
             outsize, totstride, RFsize, ms_per_frame, ms_stride = self.segment_mean.calculate_stride(seq_len,
-                                                                                                conv_layers_list)
+                                                                                                     conv_layers_list)
             frames_pred, secs_pred = self.segment_mean.get_sec_bounds(b, totstride, attention_mask)
             
         hidden_states, extract_features = self.feature_projection(x)
 
-        x, targets_segments, negatives_segments = self.negative_sampler(hidden_states)
-    
+        x, targets_segments, negatives_segments = self.negative_sampler(hidden_states, attention_mask=attention_mask)
+        
         attention_mask = attention_mask.bool()
         encoder_outputs = self.encoder(
             hidden_states,
@@ -481,16 +375,17 @@ class Wav2Vec2ModelForSegmentation(Wav2Vec2PreTrainedModel):
 
         extract_features = self.feature_extractor(input_values)
         extract_features = extract_features.transpose(1, 2)
-        
-        extract_features, targets_frames, negatives_frames = self.negative_sampler(extract_features)
-        
         # compute reduced attention_mask corresponding to feature vectors
         attention_mask1 = self._get_feature_vector_attention_mask(
             extract_features.shape[1], attention_mask, add_adapter=False
         )
 
-        frame_loss, frame_acc_score = self.negative_sampler.loss(extract_features, targets_frames, negatives_frames, 
-                                                                attention_mask=attention_mask1)
+        extract_features, targets_frames, negatives_frames = self.negative_sampler(extract_features, 
+                                                                                   attention_mask=attention_mask1)
+        
+
+        frame_loss, frame_acc_score = self.negative_sampler.loss(extract_features, targets_frames, negatives_frames,
+                                                                 attention_mask=attention_mask1)
         
         b, mask, x, attention_mask = self.segment_mean(extract_features, attention_mask1, 
                                                        conv_layers = conv_layers_list)
@@ -506,7 +401,7 @@ class Wav2Vec2ModelForSegmentation(Wav2Vec2PreTrainedModel):
         
         hidden_states, extract_features = self.feature_projection(x)
 
-        x, targets_segments, negatives_segments = self.negative_sampler(hidden_states)
+        x, targets_segments, negatives_segments = self.negative_sampler(hidden_states, attention_mask=attention_mask)
     
         attention_mask = attention_mask.bool()
         encoder_outputs = self.encoder(

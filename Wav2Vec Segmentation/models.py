@@ -3,6 +3,8 @@ from torch import nn
 from utils import ConstrativeLoss, sample_negatives
 import numpy as np
 from sklearn.metrics import precision_score, recall_score, f1_score
+from pytorch_lightning import LightningDataModule, LightningModule, Trainer
+from torch import optim
 
 class TransposeLast(torch.nn.Module):
     """
@@ -23,6 +25,7 @@ class SamePad(torch.nn.Module):
             x = x[:, :, :-1]
         return x
     
+# Данная функция основана на https://github.com/felixkreuk/UnsupSeg/blob/master/utils.py
 class RMetrics(nn.Module):
     def __init__(self, eps = 1e-5, tolerance = 2, sampling_rate = 16000):
         super(RMetrics, self).__init__()
@@ -37,7 +40,7 @@ class RMetrics(nn.Module):
         sec_per_frame = 1/self.sampling_rate
 
         for layer in conv_layers:
-            in_ch, out_ch, kernel, stride = layer
+            kernel, stride = layer
             outsize = (insize + 2*pad - 1*(kernel-1)-1) / stride + 1
             insize = outsize
             totstride = totstride * stride
@@ -128,7 +131,7 @@ class RMetrics(nn.Module):
 
         return precision, recall, f1, rval
     
-    def get_metrics(self, true_secs, b, seq_len, conv_layers, attention_mask = None):
+    def get_metrics(self, true_secs, b, seq_len, conv_layers, attention_mask = None, return_secs = False):
         
         outsize, totstride, RFsize, ms_per_frame, ms_stride = self.calculate_stride(seq_len, conv_layers)
 #         print(seq_len, outsize, totstride, RFsize, ms_per_frame, ms_stride)
@@ -137,7 +140,10 @@ class RMetrics(nn.Module):
         frames_pred, secs_pred = self.get_sec_bounds(b, totstride, attention_mask)
         precision_counter, recall_counter, pred_counter, gt_counter = self.get_stats(frames_true, frames_pred)
         precision, recall, f1, rval = self.calc_metr(precision_counter, recall_counter, pred_counter, gt_counter)
-        return precision, recall, f1, rval
+        if return_secs:
+            return precision, recall, f1, rval, secs_pred
+        else:
+            return precision, recall, f1, rval
 
 class ConvFeatureEncoder(nn.Module):
     """
@@ -229,7 +235,7 @@ class AttentionCalc(nn.Module):
             return (input_length - kernel_size) // stride + 1
 
         for layer in conv_layers:
-            in_ch, out_ch, kernel_size, stride = layer
+            kernel_size, stride = layer
             input_lengths = _conv_out_length(input_lengths, kernel_size, stride)
 
         return input_lengths
@@ -376,29 +382,28 @@ class SegmentsEncoder(nn.Module):
     
 class NegativeSampler(nn.Module):
     
-    def __init__(self, n_negatives = 10, loss_args = {'reduction': 'sum'}):
+    def __init__(self, n_negatives = 1, loss_args = {'reduction': 'mean'}):
         super(NegativeSampler, self).__init__()
         self.n_negatives = n_negatives
         self.loss = ConstrativeLoss(**loss_args)
         
-    def forward(self, x, transpose = False):
-        if transpose:
-#             print('Transpose')
-            x = x.transpose(1, 2)
+    def forward(self, x, transpose = False, attention_mask = None):
+#         if transpose:
+#             x = x.transpose(1, 2)
         targets = torch.roll(x, -1, dims=1)
         
-        negatives, negs_ids = sample_negatives(targets, n_negatives = self.n_negatives)
+        negatives, negs_ids = sample_negatives(targets, n_negatives = self.n_negatives, attention_mask = attention_mask)
         return x, targets, negatives
         
-    def compute_all(self, batch, transpose = False):
+    def compute_all(self, batch, transpose = False, attention_mask = None):
         
-        x, targets, negatives = self.forward(batch, transpose)
+        x, targets, negatives = self.forward(batch, transpose, attention_mask = attention_mask)
         loss, acc_score = self.loss(x, targets, negatives)
         return loss, dict(loss=loss.item(), 
                           acc=acc_score)
 
 
-class SegmentPredictor(nn.Module):
+class SegmentPredictor(LightningModule):
     
     def __init__(self, input_size = 256, hidden_size = 64, output_size = 256):
         super(SegmentPredictor, self).__init__()
@@ -417,52 +422,109 @@ class SegmentPredictor(nn.Module):
         return x
 
 
-class FinModel(nn.Module):
+class FinModel(LightningModule):
     
-    def __init__(self, conv_args = {}, mask_args = {}, segm_enc_args = {}, 
-                 segm_predictor_args = {}, 
-                 loss_args = {"n_negatives": 10, 
-                              "loss_args": {"reduction": "mean"}}, num_epoch = 2):
+    def __init__(self, cfg 
+#                  conv_args = {}, mask_args = {}, segm_enc_args = {}, 
+#                  segm_predictor_args = {}, 
+#                  loss_args = {"n_negatives": 1, 
+#                               "loss_args": {"reduction": "mean"}}, num_epoch = 2
+                ):
         super(FinModel, self).__init__()
-        self.conv_encoder = ConvFeatureEncoder(**conv_args)
-        self.frame_predictor = NegativeSampler(**loss_args)
-        self.conv_layers_list = self.conv_encoder.conv_layers_list
-        self.segment_mean = SegmentsRepr(**mask_args)
+        self.cfg = cfg
+        self.conv_encoder = ConvFeatureEncoder(**cfg.conv_args)
+        self.frame_predictor = NegativeSampler(**cfg.loss_args)
+        self.conv_layers_list = [[i[2], i[3]] for i in self.conv_encoder.conv_layers_list]
+        self.segment_mean = SegmentsRepr(**cfg.mask_args)
         self.attention_calc = AttentionCalc()
-        self.segment_encoder = SegmentsEncoder(**segm_enc_args)
-        self.segment_recurrent = SegmentPredictor(**segm_predictor_args)
-        self.segment_predictor = NegativeSampler(**loss_args)
-        self.num_epoch = num_epoch
+        self.segment_encoder = SegmentsEncoder(**cfg.segm_enc_args)
+        self.segment_recurrent = SegmentPredictor(**cfg.segm_predictor_args)
+        self.segment_predictor = NegativeSampler(**cfg.loss_args)
+        self.num_epoch = cfg.num_epoch
         self.metr = RMetrics()
         
+    def configure_optimizers(self):
+        parameters = filter(lambda p: p.requires_grad, self.parameters())
+        if self.cfg.optimizer == "sgd":
+            self.opt = optim.SGD(parameters, lr=self.cfg.learning_rate, momentum=0.9, weight_decay=5e-4)
+        elif self.cfg.optimizer == "adam":
+            self.opt = optim.Adam(parameters, lr=self.cfg.learning_rate, weight_decay=5e-4)
+        elif self.cfg.optimizer == "ranger":
+            self.opt = optim_extra.Ranger(parameters, lr=self.cfg.learning_rate, alpha=0.5, k=6, N_sma_threshhold=5, betas=(.95, 0.999), 
+                                          eps=1e-5,
+                                          weight_decay=0)
+        else:
+            raise Exception("unknown optimizer")
+        print(f"optimizer: {self.opt}")
+        self.scheduler = optim.lr_scheduler.StepLR(self.opt,
+                                                   step_size=self.cfg.lr_anneal_step,
+                                                   gamma=self.cfg.lr_anneal_gamma)
+        
+#         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(opt, mode='min', factor=0.5,
+#                                                       patience=1, threshold=0.0001, threshold_mode='rel',
+#                                                       cooldown=0, min_lr=0, eps=1e-08, verbose=False)
+        return [self.opt]    
+        
     def forward(self, x, attention_mask):
-#         print('Start', x.shape)
         x = self.conv_encoder(x)
-        x, targets_frames, negatives_frames = self.frame_predictor(x, transpose = True)
-#         print(x.shape)
-        attention_mask1 = self.attention_calc.get_feature_vector_attention_mask(x.shape[1], attention_mask,
-                                                                                conv_layers=self.conv_layers_list)
+        x = x.transpose(1, 2)
+        attention_mask1 = self.attention_calc.get_feature_vector_attention_mask(x.shape[1], attention_mask, conv_layers=self.conv_layers_list)
+#         x, targets_frames, negatives_frames = self.frame_predictor(x, transpose=False, attention_mask=attention_mask1)
+        
         b, mask, x, attention_mask = self.segment_mean(x, attention_mask1, conv_layers = self.conv_layers_list)
-#         print(x.shape)
+        if return_secs:
+            outsize, totstride, RFsize, ms_per_frame, ms_stride = self.segment_mean.calculate_stride(seq_len,
+                                                                                                conv_layers_list)
+            frames_pred, secs_pred = self.segment_mean.get_sec_bounds(b, totstride, attention_mask)
+        
         x = self.segment_encoder(x)
-#         print(x.shape)
         x = self.segment_recurrent(x)
-        return x, b, mask, attention_mask, attention_mask1
+        if return_secs:
+            return loss, dict(frame_loss=frame_loss.item(), 
+                              frame_acc_score=frame_acc_score,
+                              segment_loss = segment_loss.item(), 
+                              segment_acc_score = segment_acc_score, 
+                              loss = loss.item(),
+                              secs_pred = secs_pred,
+                              hidden_states = hidden_states)
+        else:
+            return loss, dict(frame_loss=frame_loss.item(), 
+                              frame_acc_score=frame_acc_score,
+                              segment_loss = segment_loss.item(), 
+                              segment_acc_score = segment_acc_score, 
+                              loss = loss.item(),
+                              hidden_states = hidden_states)
     
-    def compute_all(self, x, secs, num_epoch, attention_mask):
+    def compute_all(self, x, secs, num_epoch, attention_mask,
+                    return_secs = False):
         
         seq_len = x.shape[1]
         x = self.conv_encoder(x)
-        x, targets_frames, negatives_frames = self.frame_predictor(x, transpose=True)
-        attention_mask1 = self.attention_calc.get_feature_vector_attention_mask(x.shape[1], attention_mask, conv_layers=self.conv_layers_list)
+        x = x.transpose(1, 2)
+        attention_mask1 = self.attention_calc.get_feature_vector_attention_mask(x.shape[1], attention_mask, 
+                                                                                conv_layers=self.conv_layers_list)
+        x, targets_frames, negatives_frames = self.frame_predictor(x, transpose=False, attention_mask=attention_mask1)
+#         print(negatives_frames[0, 0, 0, :] == negatives_frames[1, 0, 0, :])
         
         frame_loss, frame_acc_score = self.frame_predictor.loss(x, targets_frames, negatives_frames, attention_mask=attention_mask1)
         
         b, mask, x, attention_mask = self.segment_mean(x, attention_mask1, conv_layers = self.conv_layers_list)
-        precision, recall, f1, r_metr = self.metr.get_metrics(secs, b, seq_len, self.conv_layers_list, attention_mask=attention_mask1)
+        if return_secs:
+            precision, recall, f1, r_metr, secs_pred = self.metr.get_metrics(secs, b, 
+                                                                             seq_len, self.conv_layers_list,
+                                                                             attention_mask=attention_mask1, 
+                                                                             return_secs = return_secs)
+        else:
+            precision, recall, f1, r_metr = self.metr.get_metrics(secs, b, seq_len, self.conv_layers_list,
+                                                                  attention_mask=attention_mask1, 
+                                                                  return_secs = return_secs)
+        
+        precision, recall, f1, r_metr = self.metr.get_metrics(secs, b, seq_len, self.conv_layers_list, 
+                                                              attention_mask=attention_mask1)
         x = self.segment_encoder(x)
         
-        x, targets_segments, negatives_segments = self.segment_predictor(x)
+        x, targets_segments, negatives_segments = self.segment_predictor(x, attention_mask=attention_mask)
+#         print(negatives_segments[0, 0, 0, :] == negatives_segments[1, 0, 0, :])
         x = self.segment_recurrent(x)
         segment_loss, segment_acc_score = self.segment_predictor.loss(x, targets_segments, negatives_segments, attention_mask=attention_mask)
         
@@ -471,15 +533,45 @@ class FinModel(nn.Module):
         else:
             loss = frame_loss
         
-        return loss, dict(frame_loss=frame_loss.item(), 
-                          frame_acc_score=frame_acc_score,
-                          segment_loss = segment_loss.item(), 
-                          segment_acc_score = segment_acc_score, 
-                          loss = loss.item(), 
-                          precision = precision, 
-                          recall = recall,
-                          f1 = f1,
-                          r_metr = r_metr)
+        if return_secs:
+            return loss, dict(frame_loss=frame_loss.item(), 
+                              frame_acc_score=frame_acc_score,
+                              segment_loss = segment_loss.item(), 
+                              segment_acc_score = segment_acc_score, 
+                              loss = loss.item(), 
+                              precision = precision, 
+                              recall = recall,
+                              f1 = f1,
+                              r_metr = r_metr,
+                              secs_pred = secs_pred)
+        else:
+            return loss, dict(frame_loss=frame_loss.item(), 
+                              frame_acc_score=frame_acc_score,
+                              segment_loss = segment_loss.item(), 
+                              segment_acc_score = segment_acc_score, 
+                              loss = loss.item(), 
+                              precision = precision, 
+                              recall = recall,
+                              f1 = f1,
+                              r_metr = r_metr)
 
+    def training_step(self, batch, batch_idx):
 
+        loss, res_dict = self.compute_all(batch['batch'].to(self.device), batch['boundaries'], 
+                                                       num_epoch = self.trainer.current_epoch, 
+                                                       attention_mask = batch['attention_mask'].to(self.device))
+        self.log("train_loss", loss)
+        for key, value in res_dict.items():
+            self.log(key, value)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+
+        loss, res_dict = self.compute_all(batch['batch'].to(self.device), batch['boundaries'], 
+                                                       num_epoch = self.trainer.current_epoch, 
+                                                       attention_mask = batch['attention_mask'].to(self.device))
+        self.log("val_loss", loss)
+        for key, value in res_dict.items():
+            self.log('val_'+key, value)
+        return loss
 

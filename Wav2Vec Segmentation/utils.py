@@ -11,7 +11,7 @@ def buffered_arange(max):
         torch.arange(max, out=buffered_arange.buf)
     return buffered_arange.buf[:max]
     
-def sample_negatives(targets, n_negatives = 10):
+def sample_negatives(targets, n_negatives = 10, attention_mask = None):
         
         y = targets.clone()
         
@@ -25,26 +25,34 @@ def sample_negatives(targets, n_negatives = 10):
         cross_high = tsz * bsz
         high = tsz
 #         Большое значение - time в targets
+
         with torch.no_grad():
             assert high > 1, f"{bsz, tsz, fsz}"
 
             if n_negatives > 0:
                 tszs = buffered_arange(num).unsqueeze(-1).expand(-1, n_negatives).flatten()
 #                 тайм коды - от нуля до максимального = количеству временных срезов в таргете
-
-                neg_idxs = torch.randint(low=0, high=high - 1, size=(bsz, n_negatives * num))
-#                 Выбираем негативные индексы
-#                 Получается 
-    
-                neg_idxs[neg_idxs == tszs] += 1
-
+                if attention_mask is None:
+                    neg_idxs = torch.randint(low=0, high=high - 1, size=(bsz, n_negatives * num))
+                else:
+                    neg_list = []
+                    for i in range(bsz):
+                        att1 = attention_mask[i, :]
+                        high1 = sum(att1)
+                        if high1 == 1:
+                            high1 = len(att1)
+                        neg_idxs = torch.randint(low=0, high=high1 - 1, size=(1, n_negatives * num))
+                        neg_list.append(neg_idxs)
+                    neg_idxs = torch.cat(neg_list)
+                    neg_idxs[neg_idxs == tszs] -= 1
+                    
         if n_negatives > 0:
             for i in range(1, bsz):
                 neg_idxs[i] += i * high
 #                 Прибавляем, чтобы было сэмплирование из того же аудио сэмпла, что и сам таргет кусочек
         else:
             neg_idxs = cross_neg_idxs
-
+            
         negs = y[neg_idxs.view(-1)]
 #         Сэмплируем сами негативные примеры
         
@@ -52,6 +60,7 @@ def sample_negatives(targets, n_negatives = 10):
             2, 0, 1, 3
         )  # to NxBxTxC
         return negs, neg_idxs
+    
     
     
 # Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
