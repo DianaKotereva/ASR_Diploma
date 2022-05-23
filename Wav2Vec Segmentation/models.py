@@ -287,7 +287,6 @@ class SegmentsRepr(nn.Module):
 
         p_1 = torch.min(torch.max((d-d_1_plus), zeros_d), torch.max((d-d_1_minus), zeros_d))
         p_1[:, [0, -1]] = 0
-#         p_1[:, -1] = 0
         p_2 = torch.min(torch.max((d-d_2_plus), zeros_d), torch.max((d-d_2_minus), zeros_d))
         p_2[:, [0, 1]] = 0
         p_2[:, [-2, -1]] = 0
@@ -298,12 +297,6 @@ class SegmentsRepr(nn.Module):
         b_hard = torch.tanh(10000000*pt)
         b_hard1 = (b_hard-b_soft).detach()
         b = b_soft + b_hard1
-        
-#         print('b_soft', b_soft)
-#         print('b_hard', b_hard)
-#         print('b_hard1', b_hard1)
-#         print('b', b)
-#         print(indexes)
         
         indexes_z = torch.zeros(frames.shape[0], 1).to(frames.device)
         indexes_o = torch.ones(frames.shape[0], 1).to(frames.device)
