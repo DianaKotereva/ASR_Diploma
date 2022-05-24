@@ -11,15 +11,59 @@ from transformers_f.src.transformers.models.wav2vec2.modeling_wav2vec2 import (W
                                                                                Wav2Vec2FeatureExtractor, 
                                                                                Wav2Vec2PositionalConvEmbedding)
 from utils import buffered_arange, sample_negatives, ConstrativeLoss
-from models import NegativeSampler, TransposeLast, SamePad
+from models import NegativeSampler, TransposeLast, SamePad, SegmentsRepr
 from transformers_f.src.transformers.deepspeed import is_deepspeed_zero3_enabled
 from typing import Optional, Tuple, Union
 import gc
+from models import ConvFeatureEncoder
 
 # Приведенные функции основаны на https://github.com/NVIDIA/NeMo и https://github.com/huggingface    
+
+# class NegativeSampler(nn.Module):
+    
+#     def __init__(self, n_negatives = 1, loss_args = {'reduction': 'mean'}):
+#         super(NegativeSampler, self).__init__()
+#         self.n_negatives = n_negatives
+#         self.loss = ConstrativeLoss(**loss_args)
+        
+#     def forward(self, x, transpose = False, attention_mask = None):
+# #         if transpose:
+# #             x = x.transpose(1, 2)
+#         targets = torch.roll(x, -1, dims=1)
+        
+#         negatives, negs_ids = sample_negatives(targets, n_negatives = self.n_negatives, attention_mask = attention_mask)
+#         return x, targets, negatives
+        
+#     def compute_all(self, batch, transpose = False, attention_mask = None):
+        
+#         x, targets, negatives = self.forward(batch, transpose, attention_mask = attention_mask)
+#         loss, acc_score = self.loss(x, targets, negatives)
+#         return loss, dict(loss=loss.item(), 
+#                           acc=acc_score)
+
+    
+# class TransposeLast(torch.nn.Module):
+#     """
+#     Transposes last dimension. Useful for adding to a sequential block.
+#     """
+
+#     def forward(self, x):
+#         return x.transpose(-2, -1)
+
+
+# class SamePad(torch.nn.Module):
+#     def __init__(self, kernel_size):
+#         super().__init__()
+#         self.remove = kernel_size % 2 == 0
+
+#     def forward(self, x):
+#         if self.remove:
+#             x = x[:, :, :-1]
+#         return x
+    
 # Данная функция основана на https://github.com/felixkreuk/UnsupSeg/blob/master/utils.py
 class RMetrics(nn.Module):
-    def __init__(self, eps = 1e-5, tolerance = 2, sampling_rate = 16000):
+    def __init__(self, eps = 1e-5, tolerance = 1, sampling_rate = 16000):
         super(RMetrics, self).__init__()
         self.tolerance = tolerance
         self.eps = eps
@@ -100,8 +144,11 @@ class RMetrics(nn.Module):
                 min_dist = np.abs(np.array(y) - yhat_i).min()
                 precision_counter += (min_dist <= self.tolerance)
             for y_i in y:
-                min_dist = np.abs(np.array(yhat) - y_i).min()
-                recall_counter += (min_dist <= self.tolerance)
+                if len(yhat) > 0:
+                    min_dist = np.abs(np.array(yhat) - y_i).min()
+                    recall_counter += (min_dist <= self.tolerance)
+                else:
+                    recall_counter += 0
             pred_counter += len(yhat)
             gt_counter += len(y)
 
@@ -139,88 +186,91 @@ class RMetrics(nn.Module):
 
     
 
-class SegmentsRepr(nn.Module):
-    def __init__(self, thres = 0.05):
-        super(SegmentsRepr, self).__init__()
-        self.thres = thres
+# class SegmentsRepr(nn.Module):
+#     def __init__(self, thres = 0.05):
+#         super(SegmentsRepr, self).__init__()
+#         self.thres = thres
     
-    def boundary(self, frames):
+#     def boundary(self, frames):
 
-        #batch_size x seq_len x dim
-        frames_1_plus = frames.roll(-1, dims = 1)
-        cos = torch.cosine_similarity(frames, frames_1_plus, dim=-1)[:, :-1]
+#         #batch_size x seq_len x dim
+# #         frames_1_plus = frames.roll(1, dims = 1)
+# #         cos = torch.cosine_similarity(frames, frames_1_plus, dim=-1)[:, 1:]
+# #         cos = torch.cat(cos[:, 0], cos, dim = 1)
         
-        min_cos = torch.min(cos, dim=1).values
-        min_cos = min_cos.unsqueeze(1).expand(min_cos.shape[0], frames.shape[1]-1)
-        max_cos = torch.max(cos, dim=1).values
-        max_cos = max_cos.unsqueeze(1).expand(max_cos.shape[0], frames.shape[1]-1)
+#         frames_1_plus = frames.roll(1, dims = 1)
+#         cos = torch.cosine_similarity(frames, frames_1_plus, dim=-1)[:, 1:]
+#         cos = torch.cat([cos[:, 0].unsqueeze(1), cos], dim = 1)
+# #         cos[:, -1] = 0
         
-        d = torch.ones(frames.shape[0], (frames.shape[1])-1).to(frames.device)-(cos - min_cos)/(max_cos-min_cos+0.0000001)
-
-        d_1_plus = d.roll(-1, dims = 1)
-        d_2_plus = d.roll(-2, dims = 1)
-        d_1_minus = d.roll(1, dims = 1)
-        d_2_minus = d.roll(2, dims = 1)
-
-        zeros_d = torch.zeros(d.shape).to(frames.device)
-
-        p_1 = torch.min(torch.max((d-d_1_plus), zeros_d), torch.max((d-d_1_minus), zeros_d))
-        p_1[:, [0, -1]] = 0
-        p_2 = torch.min(torch.max((d-d_2_plus), zeros_d), torch.max((d-d_2_minus), zeros_d))
-        p_2[:, [0, 1]] = 0
-        p_2[:, [-2, -1]] = 0
-
-        pt = torch.min(torch.max(torch.max(p_1, p_2)-torch.full(p_1.shape, self.thres).to(frames.device), zeros_d), p_1)
-
-        b_soft = torch.tanh(10*pt)
-        b_hard = torch.tanh(10000000*pt)
-        b_hard1 = (b_hard-b_soft).detach()
-        b = b_soft + b_hard1
+#         min_cos = torch.min(cos, dim=1).values
+#         min_cos = min_cos.unsqueeze(1).expand(min_cos.shape[0], frames.shape[1])
+#         max_cos = torch.max(cos, dim=1).values
+#         max_cos = max_cos.unsqueeze(1).expand(max_cos.shape[0], frames.shape[1])
         
-        indexes_z = torch.zeros(frames.shape[0], 1).to(frames.device)
-        indexes_o = torch.ones(frames.shape[0], 1).to(frames.device)
-        indexes1 = torch.cat([indexes_o, b[:, 1:], indexes_z], dim=1)
+#         d = torch.ones(frames.shape[0], (frames.shape[1])).to(frames.device)-(cos - min_cos)/(max_cos-min_cos)
+
+#         d_1_plus = d.roll(-1, dims = 1)
+#         d_2_plus = d.roll(-2, dims = 1)
+#         d_1_minus = d.roll(1, dims = 1)
+#         d_2_minus = d.roll(2, dims = 1)
+
+#         zeros_d = torch.zeros(d.shape).to(frames.device)
+
+#         p_1 = torch.min(torch.max((d-d_1_plus), zeros_d), torch.max((d-d_1_minus), zeros_d))
+#         p_1[:, [0, -1]] = 0
+#         p_2 = torch.min(torch.max((d-d_2_plus), zeros_d), torch.max((d-d_2_minus), zeros_d))
+#         p_2[:, [0, 1]] = 0
+#         p_2[:, [-2, -1]] = 0
+
+#         pt = torch.min(torch.max(torch.max(p_1, p_2)-torch.full(p_1.shape, self.thres).to(frames.device), zeros_d), p_1)
+
+#         b_soft = torch.tanh(10*pt)
+#         b_hard = torch.tanh(10000000*pt)
+#         b_hard1 = (b_hard-b_soft).detach()
+#         b = b_soft + b_hard1
         
-        return indexes1
+# #         indexes_o = torch.ones(frames.shape[0], 1).to(frames.device)
+#         return b
     
-    def receive_mask(self, b):
-        b_cumsum = torch.cumsum(b, axis=1)
-        num_fr = torch.sum(b, axis=1)
+#     def receive_mask(self, b):
+#         b_cumsum = torch.cumsum(b, axis=1)
+#         num_fr = torch.sum(b, axis=1)
         
-        # Создать arange
-        cc = torch.arange(1, int(torch.max(num_fr))+1).unsqueeze(0).unsqueeze(0).expand(b_cumsum.shape[0], b_cumsum.shape[1], 
-                                                                                       int(torch.max(num_fr))).to(b.device)
-        # Получение индексов
-        b_cumsum1 = b_cumsum.unsqueeze(-1).expand(b_cumsum.shape[0], b_cumsum.shape[1], cc.shape[-1])
-        unres = torch.tanh(10*torch.abs(cc - b_cumsum1))
-        res = torch.ones(unres.shape).to(b.device)-unres
+#         # Создать arange
+#         cc = torch.arange(1, int(torch.max(num_fr))+1).unsqueeze(0).unsqueeze(0).expand(b_cumsum.shape[0], b_cumsum.shape[1], 
+#                                                                                        int(torch.max(num_fr))).to(b.device)
+#         # Получение индексов
+#         b_cumsum1 = b_cumsum.unsqueeze(-1).expand(b_cumsum.shape[0], b_cumsum.shape[1], cc.shape[-1])
+#         unres = torch.tanh(10*torch.abs(cc - b_cumsum1))
+#         res = torch.ones(unres.shape).to(b.device)-unres
         
-        # Нормирование
-        sums = torch.sum(res, dim=1).unsqueeze(1).expand(res.shape)+unres # + unres чтобы не было null значений на нулях
-        masks = res/sums
-        masks = masks.transpose(2, 1)
+#         # Нормирование
+#         sums = torch.sum(res, dim=1).unsqueeze(1).expand(res.shape)+unres # + unres чтобы не было null значений на нулях
+#         masks = res/sums
+#         masks = masks.transpose(2, 1)
         
-        return masks
+#         return masks
     
-    def receive_attentions(self, mask, attention_mask):
-        mask1 = mask.transpose(2, 1)
-        att1 = attention_mask.float().unsqueeze(-1).expand(tuple(mask1.shape))
-        res1 = (mask1.to(att1.device)*att1).sum(dim=1)
-        res1[res1>0] = 1
-        return res1
+#     def receive_attentions(self, mask, attention_mask):
+#         mask1 = mask.transpose(2, 1)
+#         att1 = attention_mask.float().unsqueeze(-1).expand(tuple(mask1.shape))
+#         res1 = (mask1.to(att1.device)*att1).sum(dim=1)
+#         res1[res1>0] = 1
+#         return res1
     
-    def forward(self, frames, attention_mask=None, conv_layers = None):
-        # Получение сегментов
-        b = self.boundary(frames)
-        mask = self.receive_mask(b)
+#     def forward(self, frames, attention_mask=None, conv_layers = None):
+#         # Получение сегментов
+#         b = self.boundary(frames)
+#         mask = self.receive_mask(b)
         
-        segments = torch.bmm(mask.to(frames.device), frames)
+#         segments = torch.bmm(mask.to(frames.device), frames)
     
-        if attention_mask is not None and conv_layers is not None:
-            attention_mask = self.receive_attentions(mask, attention_mask)
-            return b, mask, segments, attention_mask.long()
-        else:
-            return b, mask, segments
+#         if attention_mask is not None and conv_layers is not None:
+#             attention_mask = self.receive_attentions(mask, attention_mask)
+#             return b, mask, segments, attention_mask.long()
+#         else:
+#             return b, mask, segments
 
 
 
@@ -230,8 +280,24 @@ class Wav2Vec2ModelForSegmentation(Wav2Vec2PreTrainedModel):
         super().__init__(config)
         self.config = config
         self.feature_extractor = Wav2Vec2FeatureExtractor(config)
+#         self.feature_extractor = ConvFeatureEncoder(conv_layers = [[1, 256, 10, 5], 
+#                                                                    [256, 256, 8, 4], 
+#                                                                    [256, 256, 4, 2], 
+#                                                                    [256, 256, 4, 2], 
+#                                                                    [256, 256, 4, 2]],
+#                                                     conv_bias = False)
+#         self.feature_extractor = ConvFeatureEncoder(conv_layers = [[1, 512, 10, 5], 
+#                                                                    [512, 512, 8, 4], 
+#                                                                    [512, 512, 4, 2], 
+#                                                                    [512, 512, 4, 2], 
+#                                                                    [512, 512, 4, 2]],
+#                                                     conv_bias = False)
+        
+#         self.project_extracted = nn.Linear(256, 64)
+        
         self.feature_projection = Wav2Vec2FeatureProjection(config)
 
+        self.project_back = nn.Linear(256, 512)
         self.masked_spec_embed = nn.Parameter(torch.FloatTensor(config.hidden_size).uniform_())
 
         if config.do_stable_layer_norm:
@@ -262,6 +328,7 @@ class Wav2Vec2ModelForSegmentation(Wav2Vec2PreTrainedModel):
         
         extract_features = self.feature_extractor(input_values)
         extract_features = extract_features.transpose(1, 2)
+#         extract_features = self.project_extracted(extract_features)
         
         attention_mask1 = self._get_feature_vector_attention_mask(
             extract_features.shape[1], attention_mask, add_adapter=False
@@ -282,6 +349,7 @@ class Wav2Vec2ModelForSegmentation(Wav2Vec2PreTrainedModel):
                                                                                                      conv_layers_list)
             frames_pred, secs_pred = self.segment_mean.get_sec_bounds(b, totstride, attention_mask)
             
+#         x = self.project_back(x)
         hidden_states, extract_features = self.feature_projection(x)
 
         x, targets_segments, negatives_segments = self.negative_sampler(hidden_states, attention_mask=attention_mask)
@@ -328,10 +396,14 @@ class Wav2Vec2ModelForSegmentation(Wav2Vec2PreTrainedModel):
         
         conv_layers_list = [(kernel_size, stride) for kernel_size, stride in zip(self.config.conv_kernel, 
                                                                                  self.config.conv_stride)]
+#         conv_layers_list = [[i[2], i[3]] for i in self.feature_extractor.conv_layers_list]
+        
         seq_len = input_values.shape[1]
 
         extract_features = self.feature_extractor(input_values)
         extract_features = extract_features.transpose(1, 2)
+#         extract_features = self.project_extracted(extract_features)
+        
         # compute reduced attention_mask corresponding to feature vectors
         attention_mask1 = self._get_feature_vector_attention_mask(
             extract_features.shape[1], attention_mask, add_adapter=False
@@ -356,6 +428,7 @@ class Wav2Vec2ModelForSegmentation(Wav2Vec2PreTrainedModel):
                                                                   attention_mask=attention_mask1, 
                                                                   return_secs = return_secs)
         
+#         x = self.project_back(x)
         hidden_states, extract_features = self.feature_projection(x)
 
         x, targets_segments, negatives_segments = self.negative_sampler(hidden_states, attention_mask=attention_mask)
