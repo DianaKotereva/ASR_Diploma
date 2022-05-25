@@ -267,20 +267,25 @@ class AttentionCalc(nn.Module):
         return attention_mask
     
 class SegmentsRepr(nn.Module):
-    def __init__(self, thres = 0.05):
+    def __init__(self, thres = 0.05, segment = 'first', add_one = False):
         super(SegmentsRepr, self).__init__()
         self.thres = thres
+        self.segment = segment
+        self.add_one = add_one
     
     def boundary(self, frames):
 
         #batch_size x seq_len x dim
-#         frames_1_plus = frames.roll(1, dims = 1)
-#         cos = torch.cosine_similarity(frames, frames_1_plus, dim=-1)[:, 1:]
-#         cos = torch.cat(cos[:, 0], cos, dim = 1)
         
-        frames_1_plus = frames.roll(1, dims = 1)
-        cos = torch.cosine_similarity(frames, frames_1_plus, dim=-1)[:, 1:]
-        cos = torch.cat([cos[:, 0].unsqueeze(1), cos], dim = 1)
+        if self.segment == 'last':
+            frames_1_minus = frames.roll(-1, dims = 1)
+            cos = torch.cosine_similarity(frames, frames_1_minus, dim=-1)[:, :-1]
+            cos = torch.cat([cos, cos[:, -1].unsqueeze(1)], dim = 1)
+        
+        if self.segment == 'first':
+            frames_1_plus = frames.roll(1, dims = 1)
+            cos = torch.cosine_similarity(frames, frames_1_plus, dim=-1)[:, 1:]
+            cos = torch.cat([cos[:, 0].unsqueeze(1), cos], dim = 1)
 #         cos[:, -1] = 0
         
         min_cos = torch.min(cos, dim=1).values
@@ -309,9 +314,12 @@ class SegmentsRepr(nn.Module):
         b_hard = torch.tanh(10000000*pt)
         b_hard1 = (b_hard-b_soft).detach()
         b = b_soft + b_hard1
-        
-        indexes_o = torch.ones(frames.shape[0], 1).to(frames.device)
-        return b
+        if self.add_one:
+            indexes_o = torch.ones(frames.shape[0], 1).to(frames.device)
+            indexes1 = torch.cat([indexes_o, b[:, 1:]], dim=1)
+        else:
+            indexes1 = b
+        return indexes1
     
     def receive_mask(self, b):
         b_cumsum = torch.cumsum(b, axis=1)
