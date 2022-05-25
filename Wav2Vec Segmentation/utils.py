@@ -39,12 +39,13 @@ def sample_negatives(targets, n_negatives = 10, attention_mask = None):
                     for i in range(bsz):
                         att1 = attention_mask[i, :]
                         high1 = sum(att1)
-                        if high1 == 1:
+                        if high1 <= 1:
                             high1 = len(att1)
                         neg_idxs = torch.randint(low=0, high=high1 - 1, size=(1, n_negatives * num))
                         neg_list.append(neg_idxs)
                     neg_idxs = torch.cat(neg_list)
                     neg_idxs[neg_idxs == tszs] -= 1
+                    neg_idxs[neg_idxs < 0] +=3
                     
         if n_negatives > 0:
             for i in range(1, bsz):
