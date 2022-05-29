@@ -322,6 +322,7 @@ class SegmentsRepr(nn.Module):
         return indexes1
     
     def receive_mask(self, b):
+        
         b_cumsum = torch.cumsum(b, axis=1)
         num_fr = torch.sum(b, axis=1)
         
@@ -699,7 +700,10 @@ class FinModel1(LightningModule):
         super(FinModel1, self).__init__()
         self.cfg = cfg
         self.conv_encoder = ConvFeatureEncoder(**cfg.conv_args)
-#         self.projection = nn.Linear(256, 64) 
+        if 'use_projection' not in list(self.cfg.__dict__.keys()):
+            self.cfg.use_projection = False
+        if self.cfg.use_projection:
+            self.projection = nn.Linear(256, 64) 
         # В работе https://github.com/felixkreuk/UnsupSeg projection улучшило r метрику за счет снижения размерности при работе с 
         # триплетами
         # Так как данная работа изначально основана на другой архитектуре, снижение размерности под комментарием
@@ -738,6 +742,8 @@ class FinModel1(LightningModule):
     def forward(self, x, attention_mask, return_secs):
         x = self.conv_encoder(x)
         x = x.transpose(1, 2)
+        if self.cfg.use_projection:
+            x = self.projection(x)
         
         attention_mask1 = self.attention_calc.get_feature_vector_attention_mask(x.shape[1], attention_mask, 
                                                                                 conv_layers=self.conv_layers_list)
@@ -751,7 +757,7 @@ class FinModel1(LightningModule):
         if return_secs:
             return loss, dict(frame_loss=frame_loss.item(), 
                               frame_acc_score=frame_acc_score,
-                              secs_pred = secs_pred,
+                              secs_pred = secs_preds,
                               hidden_states = x)
         else:
             return loss, dict(frame_loss=frame_loss.item(), 
@@ -765,7 +771,8 @@ class FinModel1(LightningModule):
         seq_len = x.shape[1]
         x = self.conv_encoder(x)
         x = x.transpose(1, 2)
-#         x = self.projection(x)
+        if self.cfg.use_projection:
+            x = self.projection(x)
 
         attention_mask1 = self.attention_calc.get_feature_vector_attention_mask(x.shape[1], attention_mask, 
                                                                                 conv_layers=self.conv_layers_list)
@@ -796,7 +803,7 @@ class FinModel1(LightningModule):
                               recall = recall,
                               f1 = f1,
                               r_metr = r_metr,
-                              secs_pred = secs_pred)
+                              secs_pred = secs_preds)
         else:
             return loss, dict(frame_loss=frame_loss.item(), 
 #                               frame_acc_score=frame_acc_score,
