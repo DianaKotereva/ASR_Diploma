@@ -297,7 +297,7 @@ class Wav2Vec2ModelForSegmentation(Wav2Vec2PreTrainedModel):
         
         self.feature_projection = Wav2Vec2FeatureProjection(config)
 
-        self.project_back = nn.Linear(256, 512)
+#         self.project_back = nn.Linear(256, 512)
         self.masked_spec_embed = nn.Parameter(torch.FloatTensor(config.hidden_size).uniform_())
 
         if config.do_stable_layer_norm:
