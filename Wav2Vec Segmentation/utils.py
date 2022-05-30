@@ -3,8 +3,6 @@ import torch.nn.functional as F
 from torch import nn
 import numpy as np
 
-# Приведенные функции основаны на https://github.com/NVIDIA/NeMo и https://github.com/huggingface    
-
 def buffered_arange(max):
     if not hasattr(buffered_arange, "buf"):
         buffered_arange.buf = torch.LongTensor()
@@ -41,12 +39,13 @@ def sample_negatives(targets, n_negatives = 10, attention_mask = None):
                     for i in range(bsz):
                         att1 = attention_mask[i, :]
                         high1 = sum(att1)
-                        if high1 == 1:
+                        if high1 <= 1:
                             high1 = len(att1)
                         neg_idxs = torch.randint(low=0, high=high1 - 1, size=(1, n_negatives * num))
                         neg_list.append(neg_idxs)
                     neg_idxs = torch.cat(neg_list)
                     neg_idxs[neg_idxs == tszs] -= 1
+                    neg_idxs[neg_idxs < 0] +=3
                     
         if n_negatives > 0:
             for i in range(1, bsz):
@@ -124,17 +123,19 @@ class ConstrativeLoss(nn.Module):
 
         # Transpose similarity scores to (T*B)xF for loss
         similarity_scores = similarity_scores.transpose(0, 2)
-        similarity_scores = similarity_scores.reshape(-1, similarity_scores.size(-1))
+        similarity_scores1 = similarity_scores.reshape(-1, similarity_scores.size(-1))
 
         attent = attention_mask[:, :-1].transpose(1, 0)
-        attent = attent.reshape(-1)
+        attent1 = attent.reshape(-1)
         
-        loss = torch.mean(F.cross_entropy(similarity_scores, similarity_targets, reduction='none')*attent)
+        loss = torch.mean(F.cross_entropy(similarity_scores1, similarity_targets, reduction='none')*attent1)
 
-        acc_score = np.mean((torch.argmax(similarity_scores, dim = 1)*attent).cpu().numpy() == 0)
+        acc_score = np.mean((torch.argmax(similarity_scores1, dim = 1)*attent1).cpu().numpy() == 0)
         return loss, acc_score
 
     def _calculate_similarity(self, logits, negatives, targets):
+#         neg_is_pos = (targets == negatives).all(-1)
+#         print(neg_is_pos)
         targets = targets.unsqueeze(0)
         targets = torch.cat([targets, negatives], dim=0) 
         if self.cut:
@@ -142,4 +143,6 @@ class ConstrativeLoss(nn.Module):
             targets = targets[:, :, :-1, :]
         logits = torch.cosine_similarity(logits.float(), targets.float(), dim=-1).type_as(logits)
         logits /= self.logit_temp
+#         if neg_is_pos.any():
+#             logits[1:][neg_is_pos] = float("-inf")
         return logits

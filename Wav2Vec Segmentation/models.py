@@ -5,6 +5,9 @@ import numpy as np
 from sklearn.metrics import precision_score, recall_score, f1_score
 from pytorch_lightning import LightningDataModule, LightningModule, Trainer
 from torch import optim
+from collections import defaultdict
+from scipy.signal import find_peaks
+import torch.nn.functional as F
 
 class TransposeLast(torch.nn.Module):
     """
@@ -108,8 +111,11 @@ class RMetrics(nn.Module):
                 min_dist = np.abs(np.array(y) - yhat_i).min()
                 precision_counter += (min_dist <= self.tolerance)
             for y_i in y:
-                min_dist = np.abs(np.array(yhat) - y_i).min()
-                recall_counter += (min_dist <= self.tolerance)
+                if len(yhat) > 0:
+                    min_dist = np.abs(np.array(yhat) - y_i).min()
+                    recall_counter += (min_dist <= self.tolerance)
+                else:
+                    recall_counter += 0
             pred_counter += len(yhat)
             gt_counter += len(y)
 
@@ -261,22 +267,33 @@ class AttentionCalc(nn.Module):
         return attention_mask
     
 class SegmentsRepr(nn.Module):
-    def __init__(self, thres = 0.05):
+    def __init__(self, thres = 0.05, segment = 'first', add_one = False):
         super(SegmentsRepr, self).__init__()
         self.thres = thres
+        self.segment = segment
+        self.add_one = add_one
     
     def boundary(self, frames):
 
         #batch_size x seq_len x dim
-        frames_1_plus = frames.roll(-1, dims = 1)
-        cos = torch.cosine_similarity(frames, frames_1_plus, dim=-1)[:, :-1]
+        
+        if self.segment == 'last':
+            frames_1_minus = frames.roll(-1, dims = 1)
+            cos = torch.cosine_similarity(frames, frames_1_minus, dim=-1)[:, :-1]
+            cos = torch.cat([cos, cos[:, -1].unsqueeze(1)], dim = 1)
+        
+        if self.segment == 'first':
+            frames_1_plus = frames.roll(1, dims = 1)
+            cos = torch.cosine_similarity(frames, frames_1_plus, dim=-1)[:, 1:]
+            cos = torch.cat([cos[:, 0].unsqueeze(1), cos], dim = 1)
+#         cos[:, -1] = 0
         
         min_cos = torch.min(cos, dim=1).values
-        min_cos = min_cos.unsqueeze(1).expand(min_cos.shape[0], frames.shape[1]-1)
+        min_cos = min_cos.unsqueeze(1).expand(min_cos.shape[0], frames.shape[1])
         max_cos = torch.max(cos, dim=1).values
-        max_cos = max_cos.unsqueeze(1).expand(max_cos.shape[0], frames.shape[1]-1)
+        max_cos = max_cos.unsqueeze(1).expand(max_cos.shape[0], frames.shape[1])
         
-        d = torch.ones(frames.shape[0], (frames.shape[1])-1).to(frames.device)-(cos - min_cos)/(max_cos-min_cos)
+        d = torch.ones(frames.shape[0], (frames.shape[1])).to(frames.device)-(cos - min_cos)/(max_cos-min_cos)
 
         d_1_plus = d.roll(-1, dims = 1)
         d_2_plus = d.roll(-2, dims = 1)
@@ -287,7 +304,6 @@ class SegmentsRepr(nn.Module):
 
         p_1 = torch.min(torch.max((d-d_1_plus), zeros_d), torch.max((d-d_1_minus), zeros_d))
         p_1[:, [0, -1]] = 0
-#         p_1[:, -1] = 0
         p_2 = torch.min(torch.max((d-d_2_plus), zeros_d), torch.max((d-d_2_minus), zeros_d))
         p_2[:, [0, 1]] = 0
         p_2[:, [-2, -1]] = 0
@@ -298,42 +314,26 @@ class SegmentsRepr(nn.Module):
         b_hard = torch.tanh(10000000*pt)
         b_hard1 = (b_hard-b_soft).detach()
         b = b_soft + b_hard1
-        
-#         print('b_soft', b_soft)
-#         print('b_hard', b_hard)
-#         print('b_hard1', b_hard1)
-#         print('b', b)
-#         print(indexes)
-        
-        indexes_z = torch.zeros(frames.shape[0], 1).to(frames.device)
-        indexes_o = torch.ones(frames.shape[0], 1).to(frames.device)
-        indexes1 = torch.cat([indexes_o, b[:, 1:], indexes_z], dim=1)
-#         indexes1[:, 0] = 1
-#         print(indexes1)
-        
+        if self.add_one:
+            indexes_o = torch.ones(frames.shape[0], 1).to(frames.device)
+            indexes1 = torch.cat([indexes_o, b[:, 1:]], dim=1)
+        else:
+            indexes1 = b
         return indexes1
     
     def receive_mask(self, b):
-#         print(b.shape)
-#         print(b)
+        
         b_cumsum = torch.cumsum(b, axis=1)
         num_fr = torch.sum(b, axis=1)
         
         # Создать arange
         cc = torch.arange(1, int(torch.max(num_fr))+1).unsqueeze(0).unsqueeze(0).expand(b_cumsum.shape[0], b_cumsum.shape[1], 
                                                                                        int(torch.max(num_fr))).to(b.device)
-#         print(c.shape)
-#         maxs = num_fr.unsqueeze(-1).unsqueeze(-1).expand(c.shape[0], c.shape[1], c.shape[-1])
-#         cc = c.clone().to(b.device)
-#         cc[cc>maxs] = 0 # Проверить, пойдут ли градиенты через эти ворота
         
-#         print(cc.shape)
         # Получение индексов
         b_cumsum1 = b_cumsum.unsqueeze(-1).expand(b_cumsum.shape[0], b_cumsum.shape[1], cc.shape[-1])
         unres = torch.tanh(10*torch.abs(cc - b_cumsum1))
         res = torch.ones(unres.shape).to(b.device)-unres
-        
-#         print(res.shape)
         
         # Нормирование
         sums = torch.sum(res, dim=1).unsqueeze(1).expand(res.shape)+unres # + unres чтобы не было null значений на нулях
@@ -354,8 +354,6 @@ class SegmentsRepr(nn.Module):
         b = self.boundary(frames)
         mask = self.receive_mask(b)
         
-#         print('Mask', mask.shape)
-#         print('Frames', frames.shape)
         segments = torch.bmm(mask.to(frames.device), frames)
     
         if attention_mask is not None and conv_layers is not None:
@@ -433,6 +431,7 @@ class FinModel(LightningModule):
         super(FinModel, self).__init__()
         self.cfg = cfg
         self.conv_encoder = ConvFeatureEncoder(**cfg.conv_args)
+#         self.projection = nn.Linear(256, 64)
         self.frame_predictor = NegativeSampler(**cfg.loss_args)
         self.conv_layers_list = [[i[2], i[3]] for i in self.conv_encoder.conv_layers_list]
         self.segment_mean = SegmentsRepr(**cfg.mask_args)
@@ -468,8 +467,9 @@ class FinModel(LightningModule):
     def forward(self, x, attention_mask):
         x = self.conv_encoder(x)
         x = x.transpose(1, 2)
-        attention_mask1 = self.attention_calc.get_feature_vector_attention_mask(x.shape[1], attention_mask, conv_layers=self.conv_layers_list)
-#         x, targets_frames, negatives_frames = self.frame_predictor(x, transpose=False, attention_mask=attention_mask1)
+        
+        attention_mask1 = self.attention_calc.get_feature_vector_attention_mask(x.shape[1], attention_mask, 
+                                                                                conv_layers=self.conv_layers_list)
         
         b, mask, x, attention_mask = self.segment_mean(x, attention_mask1, conv_layers = self.conv_layers_list)
         if return_secs:
@@ -575,3 +575,264 @@ class FinModel(LightningModule):
             self.log('val_'+key, value)
         return loss
 
+# Данная функция основана на https://github.com/felixkreuk/UnsupSeg
+class LambdaLayer(nn.Module):
+    def __init__(self, lambd):
+        super(LambdaLayer, self).__init__()
+        self.lambd = lambd
+    def forward(self, x):
+        return self.lambd(x)
+    
+# Данная функция основана на https://github.com/felixkreuk/UnsupSeg
+class UnsupLoss(nn.Module):
+    def __init__(self):
+        super(UnsupLoss, self).__init__()
+
+        self.training = True
+        self.pred_steps = [1]
+    
+    def score(self, f, b):
+        return F.cosine_similarity(f, b, dim=-1)
+    
+    def get_preds(self, z):
+
+        preds = defaultdict(list)
+        for i, t in enumerate(self.pred_steps):  # predict for steps 1...t
+            pos_pred = self.score(z[:, :-t], z[:, t:])  # score for positive frame
+            preds[t].append(pos_pred)
+
+            for _ in range(1):
+                if self.training:
+                    time_reorder = torch.randperm(pos_pred.shape[1])
+                    batch_reorder = torch.arange(pos_pred.shape[0])
+                else:
+                    time_reorder = torch.arange(pos_pred.shape[1])
+                    batch_reorder = torch.arange(pos_pred.shape[0])
+
+                neg_pred = self.score(z[:, :-t], z[batch_reorder][: , time_reorder])  # score for negative random frame
+                preds[t].append(neg_pred)
+        return preds
+    
+    def length_to_mask(self, length, max_len=None, dtype=None):
+        """length: B.
+        return B x max_len.
+        If max_len is None, then max of length will be used.
+        """
+        assert len(length.shape) == 1, 'Length shape should be 1 dimensional.'
+        max_len = max_len or length.max().item()
+        mask = torch.arange(max_len, device=length.device,
+                            dtype=length.dtype).expand(len(length), max_len) < length.unsqueeze(1)
+        if dtype is not None:
+            mask = torch.as_tensor(mask, dtype=dtype, device=length.device)
+        return mask
+    
+    def loss(self, preds, lengths):
+        loss = 0
+        lengths = lengths.int()
+        for t, t_preds in preds.items():
+            mask = self.length_to_mask(lengths - t)
+            out = torch.stack(t_preds, dim=-1)
+            out = F.log_softmax(out, dim=-1)
+            out = out[...,0] * mask
+            loss += -out.mean()
+        return loss
+
+# Данная функция основана на https://github.com/felixkreuk/UnsupSeg
+class GetBound(nn.Module):
+    def __init__(self):
+        super(GetBound, self).__init__()
+    
+    def max_min_norm(self, x):
+        x -= x.min(-1, keepdim=True)[0]
+        x /= x.max(-1, keepdim=True)[0]
+        return x
+
+    def replicate_first_k_frames(self, x, k, dim):
+        return torch.cat([x.index_select(dim=dim, index=torch.LongTensor([0] * k).to(x.device)), x], dim=dim)
+
+    def replicate_last_k_frames(self, x, k, dim):
+        return torch.cat([x, x.index_select(dim=dim, index=torch.LongTensor([0] * k).to(x.device))], dim=dim)
+    
+    def detect_peaks(self, x, lengths, prominence=0.1, width=None, distance=None):
+        """detect peaks of next_frame_classifier
+
+        Arguments:
+            x {Tensor} -- batch of confidence per time
+        """ 
+        out = []
+        for xi, li in zip(x, lengths):
+            if type(xi) == torch.Tensor:
+                xi = xi.cpu().detach().numpy()
+            xi = xi[:li]  # shorten to actual length
+            xmin, xmax = xi.min(), xi.max()
+            xi = (xi - xmin) / (xmax - xmin)
+#             xi = 1 - (xi - xmin) / (xmax - xmin)
+            peaks, _ = find_peaks(xi, prominence=prominence, width=width, distance=distance)
+            if len(peaks) == 0:
+                peaks = np.array([len(xi)-1])
+            out.append(peaks)
+        return out
+
+    def get_boundaries(self, preds):
+        preds1 = preds  # get scores of positive pairs
+        preds_s = []
+
+        for b in range(preds1.shape[0]):
+            preds = preds1[b, :].unsqueeze(0)
+            preds = self.replicate_first_k_frames(preds, k=1, dim=1)  # padding
+            preds = 1 - self.max_min_norm(preds)  # normalize scores (good for visualizations)
+            preds = self.detect_peaks(x=preds,
+                                 lengths=[preds.shape[1]]
+                                )  # run peak detection on scores
+            preds = preds[0] * 160 / 16000
+            preds_s.append(preds)
+        return preds_s
+
+    
+class FinModel1(LightningModule):
+    
+    def __init__(self, cfg 
+#                  conv_args = {}, mask_args = {}, segm_enc_args = {}, 
+#                  segm_predictor_args = {}, 
+#                  loss_args = {"n_negatives": 1, 
+#                               "loss_args": {"reduction": "mean"}}, num_epoch = 2
+                ):
+        super(FinModel1, self).__init__()
+        self.cfg = cfg
+        self.conv_encoder = ConvFeatureEncoder(**cfg.conv_args)
+        if 'use_projection' not in list(self.cfg.__dict__.keys()):
+            self.cfg.use_projection = False
+        if self.cfg.use_projection:
+            self.projection = nn.Linear(256, 64) 
+        # В работе https://github.com/felixkreuk/UnsupSeg projection улучшило r метрику за счет снижения размерности при работе с 
+        # триплетами
+        # Так как данная работа изначально основана на другой архитектуре, снижение размерности под комментарием
+        
+        self.frame_predictor = NegativeSampler(**cfg.loss_args)
+        self.conv_layers_list = [[i[2], i[3]] for i in self.conv_encoder.conv_layers_list]
+        self.segment_mean = SegmentsRepr(**cfg.mask_args)
+        self.attention_calc = AttentionCalc()
+#         self.segment_encoder = SegmentsEncoder(**cfg.segm_enc_args)
+#         self.segment_recurrent = SegmentPredictor(**cfg.segm_predictor_args)
+#         self.segment_predictor = NegativeSampler(**cfg.loss_args)
+        self.num_epoch = cfg.num_epoch
+        self.metr = RMetrics()
+        self.unsup_loss = UnsupLoss()
+        self.bounds = GetBound()
+        
+    def configure_optimizers(self):
+        parameters = filter(lambda p: p.requires_grad, self.parameters())
+        if self.cfg.optimizer == "sgd":
+            self.opt = optim.SGD(parameters, lr=self.cfg.learning_rate, momentum=0.9, weight_decay=5e-4)
+        elif self.cfg.optimizer == "adam":
+            self.opt = optim.Adam(parameters, lr=self.cfg.learning_rate, weight_decay=5e-4)
+        elif self.cfg.optimizer == "ranger":
+            self.opt = optim_extra.Ranger(parameters, lr=self.cfg.learning_rate, alpha=0.5, k=6, N_sma_threshhold=5, betas=(.95, 0.999), 
+                                          eps=1e-5,
+                                          weight_decay=0)
+        else:
+            raise Exception("unknown optimizer")
+        print(f"optimizer: {self.opt}")
+        self.scheduler = optim.lr_scheduler.StepLR(self.opt,
+                                                   step_size=self.cfg.lr_anneal_step,
+                                                   gamma=self.cfg.lr_anneal_gamma)
+        
+        return [self.opt]    
+        
+    def forward(self, x, attention_mask, return_secs):
+        x = self.conv_encoder(x)
+        x = x.transpose(1, 2)
+        if self.cfg.use_projection:
+            x = self.projection(x)
+        
+        attention_mask1 = self.attention_calc.get_feature_vector_attention_mask(x.shape[1], attention_mask, 
+                                                                                conv_layers=self.conv_layers_list)
+        x, targets_frames, negatives_frames = self.frame_predictor(x, transpose=False, attention_mask=attention_mask1)
+        frame_loss, frame_acc_score = self.frame_predictor.loss(x, targets_frames, negatives_frames, attention_mask=attention_mask1)
+        
+        frames_1_minus = x.roll(1, dims = 1)    
+        preds = torch.cosine_similarity(x, frames_1_minus, dim=-1)[:, 1:]
+        secs_preds = self.bounds.get_boundaries(preds)
+        
+        if return_secs:
+            return loss, dict(frame_loss=frame_loss.item(), 
+                              frame_acc_score=frame_acc_score,
+                              secs_pred = secs_preds,
+                              hidden_states = x)
+        else:
+            return loss, dict(frame_loss=frame_loss.item(), 
+                              frame_acc_score=frame_acc_score,
+                              hidden_states = x
+                             )
+    
+    def compute_all(self, x, secs, num_epoch, attention_mask, spectral_size,
+                    return_secs = False):
+        
+        seq_len = x.shape[1]
+        x = self.conv_encoder(x)
+        x = x.transpose(1, 2)
+        if self.cfg.use_projection:
+            x = self.projection(x)
+
+        attention_mask1 = self.attention_calc.get_feature_vector_attention_mask(x.shape[1], attention_mask, 
+                                                                                conv_layers=self.conv_layers_list)
+
+        x, targets_frames, negatives_frames = self.frame_predictor(x, transpose=False, attention_mask=attention_mask1)
+        frame_loss, frame_acc_score = self.frame_predictor.loss(x, targets_frames, negatives_frames, attention_mask=attention_mask1)
+        frames_1_minus = x.roll(1, dims = 1)    
+        preds = torch.cosine_similarity(x, frames_1_minus, dim=-1)[:, 1:]
+    
+        secs_preds = self.bounds.get_boundaries(preds)
+        
+        outsize, totstride, RFsize, ms_per_frame, ms_stride = self.metr.calculate_stride(seq_len, self.conv_layers_list)
+        frames_true = self.metr.get_frames(secs, totstride)
+        frames_pred = self.metr.get_frames(secs_preds, totstride)
+        
+        precision_counter, recall_counter, pred_counter, gt_counter = self.metr.get_stats(frames_true, frames_pred)
+        precision, recall, f1, r_metr = self.metr.calc_metr(precision_counter, recall_counter, pred_counter, gt_counter)
+
+        loss = frame_loss
+        
+        if return_secs:
+            return loss, dict(frame_loss=frame_loss.item(), 
+#                               frame_acc_score=frame_acc_score,
+#                               segment_loss = segment_loss.item(), 
+#                               segment_acc_score = segment_acc_score, 
+                              loss = loss.item(), 
+                              precision = precision, 
+                              recall = recall,
+                              f1 = f1,
+                              r_metr = r_metr,
+                              secs_pred = secs_preds)
+        else:
+            return loss, dict(frame_loss=frame_loss.item(), 
+#                               frame_acc_score=frame_acc_score,
+#                               segment_loss = segment_loss.item(), 
+#                               segment_acc_score = segment_acc_score, 
+                              loss = loss.item(), 
+                              precision = precision, 
+                              recall = recall,
+                              f1 = f1,
+                              r_metr = r_metr)
+
+    def training_step(self, batch, batch_idx):
+
+        loss, res_dict = self.compute_all(batch['batch'].to(self.device), batch['boundaries'], 
+                                                       num_epoch = self.trainer.current_epoch, 
+                                                       attention_mask = batch['attention_mask'].to(self.device),
+                                                       spectral_size = batch['spectral_size'])
+        self.log("train_loss", loss)
+        for key, value in res_dict.items():
+            self.log(key, value)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+
+        loss, res_dict = self.compute_all(batch['batch'].to(self.device), batch['boundaries'], 
+                                                       num_epoch = self.trainer.current_epoch, 
+                                                       attention_mask = batch['attention_mask'].to(self.device),
+                                                       spectral_size = batch['spectral_size'])
+        self.log("val_loss", loss)
+        for key, value in res_dict.items():
+            self.log('val_'+key, value)
+        return loss

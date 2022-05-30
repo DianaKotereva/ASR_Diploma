@@ -6,6 +6,6 @@
   * **model_transformers.py** - обертка модели для pytorch_lightning
   * **models.py** - модель сегментации, основанная на работе 2.	Bhati S. et al. Unsupervised Speech Segmentation and Variable Rate Representation Learning using Segmental Contrastive Predictive Coding
   * **utils.py** - алгоритм сэмплирования негативных примеров и функция потерь Contrastive Loss 
-* **Transformers_.ipynb** - тетради с обучением моделей
-* **Predict_.ipynb** - тетради с оценкой моделей
+* **ConvEncoder_lightning_.ipynb** - тетради с обучением моделей
+* **Predict_compare.ipynb** - тетради с оценкой моделей
 * **results_.csv** - файлы с оценкой метрик
